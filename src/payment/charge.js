@@ -10,13 +10,23 @@ const { FlagdProvider } = require('@openfeature/flagd-provider');
 const flagProvider = new FlagdProvider();
 
 const logger = require('./logger');
+const { FAULT_FLAG, createState, decide, InjectedFaultError } = require('./faultInjection');
+
 const tracer = trace.getTracer('payment');
 const meter = metrics.getMeter('payment');
 const transactionsCounter = meter.createCounter('demo.payment.transactions', {
   unit: '{transaction}',
 });
+const faultInjectedCounter = meter.createCounter('demo.payment.fault_injected', {
+  unit: '{request}',
+});
+const faultSuppressedCounter = meter.createCounter('demo.payment.fault_injection_suppressed', {
+  unit: '{request}',
+});
 
 const LOYALTY_LEVEL = ['platinum', 'gold', 'silver', 'bronze'];
+
+const faultState = createState();
 
 /** Return random element from given array */
 function random(arr) {
@@ -37,15 +47,54 @@ module.exports.charge = async request => {
 
     await OpenFeature.setProviderAndWait(flagProvider);
 
-    const numberVariant = await OpenFeature.getClient().getNumberValue("paymentFailure", 0);
+    const flagDetails = await OpenFeature.getClient().getNumberDetails(FAULT_FLAG, 0);
+    const { value: flagValue, variant: flagVariant, reason: flagReason } = flagDetails;
 
-    if (numberVariant > 0) {
-      // n% chance to fail with demo.user_context.loyalty_level=gold
-      if (Math.random() < numberVariant) {
-        span.setAttributes({'demo.user_context.loyalty_level': 'gold' });
+    // Always record flag state on the span regardless of whether we inject.
+    span.setAttributes({
+      'feature_flag.key': FAULT_FLAG,
+      'feature_flag.result.variant': flagVariant !== undefined ? String(flagVariant) : String(flagValue),
+      'feature_flag.result.reason': flagReason || 'UNKNOWN',
+    });
 
-        throw new Error('Payment request failed. Invalid token. demo.user_context.loyalty_level=gold');
-      }
+    const { inject, reason, activatedNow, expiredNow } = decide({
+      rate: flagValue,
+      syntheticRequest,
+      env: process.env,
+      state: faultState,
+    });
+
+    if (activatedNow) {
+      const ttl = Number(process.env.FAULT_INJECTION_MAX_MINUTES) > 0
+        ? Number(process.env.FAULT_INJECTION_MAX_MINUTES) : 15;
+      logger.warn(
+        { flag: FAULT_FLAG, rate: flagValue, variant: flagVariant, ttlMinutes: ttl,
+          envEnabled: process.env.FAULT_INJECTION_ENABLED, synthetic: syntheticRequest },
+        'Fault injection flag paymentFailure is active',
+      );
+    }
+
+    if (expiredNow) {
+      logger.warn(
+        { flag: FAULT_FLAG },
+        `Fault injection expired after ${process.env.FAULT_INJECTION_MAX_MINUTES || 15} minutes; ` +
+        'set paymentFailure to off and back on to re-arm',
+      );
+    }
+
+    if (inject) {
+      span.setAttributes({
+        'chaos.injected': true,
+        'chaos.flag': FAULT_FLAG,
+        'chaos.variant': String(flagVariant),
+        'demo.user_context.loyalty_level': 'gold',
+      });
+      faultInjectedCounter.add(1, { flag: FAULT_FLAG, variant: String(flagVariant) });
+      throw new InjectedFaultError('Payment request failed. Invalid token. demo.user_context.loyalty_level=gold');
+    }
+
+    if (['not_enabled', 'not_synthetic', 'expired'].includes(reason)) {
+      faultSuppressedCounter.add(1, { flag: FAULT_FLAG, reason });
     }
 
     const {
