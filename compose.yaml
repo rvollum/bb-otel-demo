@@ -485,6 +485,8 @@ services:
       - OTEL_EXPORTER_OTLP_PROTOCOL=grpc
       - OTEL_RESOURCE_ATTRIBUTES=${OTEL_RESOURCE_ATTRIBUTES},service.criticality=critical
       - OTEL_SERVICE_NAME=payment
+      - FAULT_INJECTION_ENABLED=${FAULT_INJECTION_ENABLED:-true}
+      - FAULT_INJECTION_MAX_MINUTES=${FAULT_INJECTION_MAX_MINUTES:-15}
     healthcheck:
       test:
         - "CMD"
